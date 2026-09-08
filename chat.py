@@ -51,6 +51,25 @@ vector_db = QdrantVectorStore.from_existing_collection(
 # Local cross-encoder used to rerank the vector search candidates
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
+
+def generate_query_variants(query: str, n: int = 3) -> list[str]:
+    """Ask the LLM for alternate phrasings of the query to widen recall,
+    since a single phrasing can miss chunks worded differently."""
+    prompt = f"""Generate {n} different rephrasings of the question below.
+Each rephrasing should preserve the original meaning but vary the wording,
+so it can surface documents phrased differently than the original.
+Return exactly {n} lines, one rephrasing per line, with no numbering or extra text.
+
+QUESTION: {query}"""
+
+    response = chat_model.invoke([{"role": "user", "content": prompt}])
+    text = response.content
+    if isinstance(text, list):
+        text = "".join(block.get("text", "") for block in text if isinstance(block, dict))
+
+    variants = [line.strip() for line in text.splitlines() if line.strip()]
+    return [query] + variants[:n]
+
 # Take the user's role and enforce it as a hard filter on retrieval, so
 # pages outside their access never reach the LLM in the first place.
 role = input("Enter your role (hr/auditor/engineer): ").strip().lower()
@@ -61,9 +80,16 @@ role_filter = build_role_filter(role)
 # Take user query
 user_query = input("Enter your query: ")
 
-# Retrieve a larger candidate set from the vector store, restricted to
-# the pages this role is permitted to access
-candidates = vector_db.similarity_search(query=user_query, k=20, filter=role_filter)
+# Multi-query retrieval: search with the original query plus several LLM-
+# generated rephrasings, then merge the results. This widens recall beyond
+# what a single phrasing's embedding would match.
+query_variants = generate_query_variants(user_query)
+
+candidates_by_content = {}
+for variant in query_variants:
+    for doc in vector_db.similarity_search(query=variant, k=20, filter=role_filter):
+        candidates_by_content[doc.page_content] = doc
+candidates = list(candidates_by_content.values())
 
 if not candidates:
     print("AI Response: No accessible content matched your query for your role.")
