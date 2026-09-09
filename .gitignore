@@ -4,3 +4,4 @@ __pycache__/
 .env
 ml-book.pdf
 .claude/
+.cache/

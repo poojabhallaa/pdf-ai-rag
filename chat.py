@@ -1,11 +1,68 @@
 import os
+import json
+import hashlib
+import sqlite3
 from dotenv import load_dotenv
+from langchain_core.embeddings import Embeddings
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_qdrant import QdrantVectorStore
 from sentence_transformers import CrossEncoder
 from qdrant_client import models
 
 load_dotenv()
+
+# Persistent, disk-backed cache shared across runs (each run of this script
+# is a fresh process, so an in-memory cache alone wouldn't help repeat use).
+CACHE_PATH = os.path.join(os.path.dirname(__file__), ".cache", "rag_cache.db")
+os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
+_cache_conn = sqlite3.connect(CACHE_PATH)
+_cache_conn.execute("CREATE TABLE IF NOT EXISTS embeddings (key TEXT PRIMARY KEY, vector TEXT)")
+_cache_conn.execute("CREATE TABLE IF NOT EXISTS responses (key TEXT PRIMARY KEY, answer TEXT)")
+_cache_conn.commit()
+
+
+def _hash_key(*parts: str) -> str:
+    return hashlib.sha256("||".join(parts).encode()).hexdigest()
+
+
+class CachedEmbeddings(Embeddings):
+    """Wraps an Embeddings model and caches embed_query results on disk,
+    so repeating the same query text never re-calls the embedding API."""
+
+    def __init__(self, embedding_model):
+        self.embedding_model = embedding_model
+
+    def embed_query(self, text: str) -> list[float]:
+        key = _hash_key("embed", text)
+        row = _cache_conn.execute("SELECT vector FROM embeddings WHERE key = ?", (key,)).fetchone()
+        if row is not None:
+            return json.loads(row[0])
+
+        vector = self.embedding_model.embed_query(text)
+        _cache_conn.execute(
+            "INSERT OR REPLACE INTO embeddings (key, vector) VALUES (?, ?)",
+            (key, json.dumps(vector)),
+        )
+        _cache_conn.commit()
+        return vector
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self.embed_query(text) for text in texts]
+
+
+def get_cached_response(role: str, query: str) -> str | None:
+    row = _cache_conn.execute(
+        "SELECT answer FROM responses WHERE key = ?", (_hash_key("response", role, query),)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def set_cached_response(role: str, query: str, answer: str) -> None:
+    _cache_conn.execute(
+        "INSERT OR REPLACE INTO responses (key, answer) VALUES (?, ?)",
+        (_hash_key("response", role, query), answer),
+    )
+    _cache_conn.commit()
 
 # 1-indexed, inclusive page ranges each role is allowed to retrieve from.
 # `None` means no restriction (full document access).
@@ -45,7 +102,7 @@ chat_model = ChatGoogleGenerativeAI(
 vector_db = QdrantVectorStore.from_existing_collection(
     url="http://localhost:6333",
     collection_name="learning-rag",
-    embedding=embedding_model,
+    embedding=CachedEmbeddings(embedding_model),
 )
 
 # Local cross-encoder used to rerank the vector search candidates
@@ -79,6 +136,13 @@ role_filter = build_role_filter(role)
 
 # Take user query
 user_query = input("Enter your query: ")
+
+# Full-response cache: an identical (role, query) pair skips retrieval,
+# reranking, and generation entirely.
+cached_answer = get_cached_response(role, user_query)
+if cached_answer is not None:
+    print("AI Response (cached):", cached_answer)
+    raise SystemExit
 
 # Multi-query retrieval: search with the original query plus several LLM-
 # generated rephrasings, then merge the results. This widens recall beyond
@@ -125,4 +189,6 @@ response = chat_model.invoke(
 answer = response.content
 if isinstance(answer, list):
     answer = "".join(block.get("text", "") for block in answer if isinstance(block, dict))
+
+set_cached_response(role, user_query, answer)
 print("AI Response:", answer)
